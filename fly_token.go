@@ -25,7 +25,6 @@ func GetToken(app string, expiry time.Duration) (string, error) {
 		"tokens", "create", "deploy",
 		"-a", app,
 		"--expiry", expiry.String(),
-		// "--name", "log-exporter (auto)", // optional
 	}
 
 	cmd := exec.Command("fly", args...)

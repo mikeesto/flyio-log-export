@@ -18,27 +18,32 @@ import (
 
 func main() {
 	var (
-		app     = flag.String("app", "", "Fly app name (required)")
-		outPath = flag.String("out", "logs.jsonl", "output JSONL path")
-		region  = flag.String("region", "", "optional region filter (e.g. syd)")
-		days    = flag.Int("days", 1, "how many days back to fetch")
-		idle    = flag.Duration("idle", 10*time.Second, "stop if no new logs for this long AND caught up")
-		catchup = flag.Duration("catchup", 2*time.Minute, "consider 'caught up' if newest log is within this of now")
+		app        = flag.String("app", "", "Fly app name (required)")
+		region     = flag.String("region", "", "optional region filter (e.g. syd)")
+		days       = flag.Int("days", 1, "how many days back to fetch")
+		idle       = flag.Duration("idle", 10*time.Second, "stop if no new logs for this long AND caught up")
+		catchup    = flag.Duration("catchup", 2*time.Minute, "consider 'caught up' if newest log is within this of now")
+		compactMax = flag.Int("compact-max", 0, "max message chars in compact output (0 = no limit)")
+		output     = flag.String("out", "logs.compact.txt", "output file path (use - for stdout)")
 	)
 	flag.Parse()
 
 	if *app == "" {
 		fatalf("--app is required")
 	}
+
+	if *days < 1 || *days > 15 {
+		fatalf("--days must be between 1 and 15")
+	}
+
 	token, err := GetToken(*app, 1*time.Hour)
 	must(err)
 
-	// Cancel on Ctrl+C
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// --- Setup HTTP Request ---
 	startTime := time.Now().UTC().Add(-time.Duration(*days) * 24 * time.Hour).Format(time.RFC3339)
-
 	u := url.URL{
 		Scheme: "https",
 		Host:   "api.fly.io",
@@ -55,13 +60,7 @@ func main() {
 	must(err)
 	req.Header.Set("Authorization", token)
 
-	// Streaming response; don’t set a short client timeout.
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-		},
-	}
-
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}}
 	resp, err := client.Do(req)
 	must(err)
 	defer resp.Body.Close()
@@ -71,80 +70,98 @@ func main() {
 		fatalf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
-	out, err := os.Create(*outPath)
-	must(err)
-	defer out.Close()
+	// --- Setup Output ---
+	var out io.Writer
+	var closer io.Closer
 
-	// We’ll read lines ourselves so we can implement an idle timeout cleanly.
-	reader := bufio.NewReader(resp.Body)
+	if *output == "-" {
+		out = os.Stdout
+		closer = io.NopCloser(nil)
+	} else {
+		f, err := os.Create(*output)
+		must(err)
+		out = f
+		closer = f
+		fmt.Fprintf(os.Stderr, "writing compact logs to %s\n", *output)
+	}
 
-	// Tracks newest timestamp seen (if present in JSON).
+	bufOut := bufio.NewWriter(out)
+
+	finish := func() {
+		bufOut.Flush()
+		closer.Close()
+	}
+	defer finish()
+
+	// --- Start Dedicated Reader Routine ---
+	linesCh := make(chan string, 100)
+	errCh := make(chan error, 1)
+
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		// Increase buffer size for huge log lines
+		scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+		for scanner.Scan() {
+			linesCh <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			errCh <- err
+		}
+		close(linesCh)
+	}()
+
+	// --- Main Loop ---
 	var newest time.Time
-
-	// Idle timer: if it fires and we’re “caught up”, we stop.
 	timer := time.NewTimer(*idle)
 	defer timer.Stop()
 
 	for {
-		// Read one JSONL line (blocking). We do it in a goroutine so we can select on idle/cancel.
-		type readResult struct {
-			line []byte
-			err  error
-		}
-		ch := make(chan readResult, 1)
-		go func() {
-			line, err := reader.ReadBytes('\n')
-			// If stream ends without trailing newline, still return the bytes.
-			if err == io.EOF && len(line) > 0 {
-				err = nil
-			}
-			ch <- readResult{line: line, err: err}
-		}()
-
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(os.Stderr, "stopped:", ctx.Err())
+			fmt.Fprintln(os.Stderr, "\nstopped:", ctx.Err())
 			return
 
 		case <-timer.C:
-			// No new lines for `idle`. Stop only if we appear caught up.
+			// Idle timeout hit
 			if newest.IsZero() {
-				// If we couldn't parse timestamps, be conservative and keep waiting.
+				// Haven't seen a timestamp yet, keep waiting
 				timer.Reset(*idle)
 				continue
 			}
 			if time.Since(newest) <= *catchup {
-				fmt.Fprintf(os.Stderr, "caught up (newest log %s), stopping\n", newest.UTC().Format(time.RFC3339))
+				fmt.Fprintf(os.Stderr, "\ncaught up (newest log %s), stopping\n", newest.UTC().Format(time.RFC3339))
 				return
 			}
-			// Not caught up yet; keep waiting.
+			// Not caught up yet
 			timer.Reset(*idle)
 
-		case rr := <-ch:
-			if rr.err != nil {
-				if rr.err == io.EOF {
-					// Server closed stream; we’re done.
-					fmt.Fprintln(os.Stderr, "stream ended by server")
-					return
-				}
-				fatalf("read error: %v", rr.err)
+		case err := <-errCh:
+			finish()
+			fatalf("stream error: %v", err)
+
+		case line, ok := <-linesCh:
+			if !ok {
+				fmt.Fprintln(os.Stderr, "stream ended by server")
+				return
 			}
-			line := strings.TrimSpace(string(rr.line))
-			if line == "" {
-				timer.Reset(*idle)
+
+			// 1. Parse JSON once
+			var fl FlyLog
+			if err := json.Unmarshal([]byte(line), &fl); err != nil {
+				// If parsing fails, print raw line
+				fmt.Fprintf(bufOut, "????-??-??T??:??:??Z ????? ???? ???????? raw: %s\n", line)
 				continue
 			}
 
-			// Write raw JSON line to output (preserve exact payload).
-			_, err := out.WriteString(line + "\n")
-			must(err)
-
-			// Update newest timestamp if the JSON has something usable.
-			if ts := extractTimestamp(line); !ts.IsZero() && ts.After(newest) {
+			// 2. Update newest timestamp from the struct
+			if ts := extractTimeFromStruct(fl); !ts.IsZero() && ts.After(newest) {
 				newest = ts
 			}
 
-			// Reset idle timer whenever we get a line.
+			// 3. Write using the struct
+			WriteCompactLog(bufOut, fl, *compactMax)
+
+			// Reset idle timer
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -156,23 +173,17 @@ func main() {
 	}
 }
 
-func extractTimestamp(jsonLine string) time.Time {
-	// Fly’s logs commonly include `timestamp` (and sometimes `time`).
-	var m map[string]any
-	if err := json.Unmarshal([]byte(jsonLine), &m); err != nil {
-		return time.Time{}
-	}
-	for _, key := range []string{"timestamp", "time"} {
-		if v, ok := m[key]; ok {
-			if s, ok := v.(string); ok {
-				// Most log timestamps are RFC3339-ish.
-				if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-					return t
-				}
-				if t, err := time.Parse(time.RFC3339, s); err == nil {
-					return t
-				}
-			}
+func extractTimeFromStruct(fl FlyLog) time.Time {
+	for _, data := range fl.Data {
+		s := data.Attributes.Timestamp
+		if s == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return t
+		}
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
 		}
 	}
 	return time.Time{}
