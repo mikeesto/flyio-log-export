@@ -1,8 +1,10 @@
 # Fly.io Log Export
 
-A lightweight Go utility that extracts Fly.io application logs into a compact, human-readable format.
+A lightweight Go utility that extracts Fly.io application logs into a compact, human-readable format. It connects to the Fly API, backfills a specific time window, streams until it catches up to the present, and then exits.
 
-It connects to the Fly API, backfills a specific time window, streams until it catches up to the present, and then exits.
+## Unresolved issue with API Usage
+
+This tool utilises the "undocumented" [internal Fly.io HTTP API endpoint](https://fly.io/docs/monitoring/logs-api-options/#1-http-api-same-as-fly-logs) to stream logs. This _claims_ to provide historical logs going back to the current retention window (about 15 days). However, currently it appears to only return logs from the past day or so.
 
 ## Motivation
 
@@ -62,7 +64,3 @@ TIMESTAMP            LVL   REG  INSTANCE MESSAGE
 2025-01-20T08:15:23Z INFO  syd  9185936b Request processed in 45ms status=200
 2025-01-20T08:15:24Z ERROR syd  9185936b Database connection failed \n retrying...
 ```
-
-## Note on API Usage
-
-This tool utilises the "undocumented" [internal Fly.io HTTP API endpoint](https://fly.io/docs/monitoring/logs-api-options/#1-http-api-same-as-fly-logs) to stream logs. This gives you access to historical logs going back to the current retention window (about 15 days).
