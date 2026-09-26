@@ -39,8 +39,7 @@ func GetToken(app string, expiry time.Duration) (string, error) {
 
 	token := extractFlyV1Token(out.String())
 	if token == "" {
-		combined := strings.TrimSpace(out.String() + "\n" + errBuf.String())
-		return "", fmt.Errorf("couldn't find FlyV1 token in flyctl output:\n%s", combined)
+		return "", fmt.Errorf("couldn't find FlyV1 token in flyctl output")
 	}
 	return token, nil
 }

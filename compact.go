@@ -11,19 +11,21 @@ import (
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 type FlyLog struct {
+	Meta struct {
+		NextToken string `json:"next_token"`
+	} `json:"meta"`
+
 	Data []struct {
 		Attributes struct {
 			Timestamp string         `json:"timestamp"`
 			Message   string         `json:"message"`
 			Level     string         `json:"level"`
-			Instance  string         `json:"instance"`
-			Region    string         `json:"region"`
 			Meta      map[string]any `json:"meta"`
 		} `json:"attributes"`
 	} `json:"data"`
 }
 
-func WriteCompactLog(w io.Writer, fl FlyLog, maxMsg int) {
+func WriteCompactLog(w io.Writer, fl FlyLog) error {
 	for _, item := range fl.Data {
 		a := item.Attributes
 
@@ -32,24 +34,15 @@ func WriteCompactLog(w io.Writer, fl FlyLog, maxMsg int) {
 		if lv == "" {
 			lv = "INFO"
 		}
-		region := strings.TrimSpace(a.Region)
-		if region == "" {
-			region = "?"
-		}
-		inst := strings.TrimSpace(a.Instance)
-		if inst == "" {
-			inst = "?"
-		}
 
 		msg := stripANSI(a.Message)
 		msg = oneLine(msg)
-		if maxMsg > 0 && len(msg) > maxMsg {
-			msg = msg[:maxMsg] + "…"
-		}
 
-		fmt.Fprintf(w, "%s %-5s %-4s %-8s %s\n",
-			ts, lv, region, inst[:min(8, len(inst))], msg)
+		if _, err := fmt.Fprintf(w, "%s %-5s %s\n", ts, lv, msg); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func stripANSI(s string) string {
@@ -76,15 +69,5 @@ func normTime(s string) string {
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t.UTC().Format(time.RFC3339Nano)
 	}
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t.UTC().Format(time.RFC3339Nano)
-	}
 	return s
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -1,66 +1,60 @@
-# Fly.io Log Export
+# flyio-log-export
 
-A lightweight Go utility that extracts Fly.io application logs into a compact, human-readable format. It connects to the Fly API, backfills a specific time window, streams until it catches up to the present, and then exits.
+`fly logs` is useful for viewing live logs, but it does not make it easy to download historical logs. So I made this tool to download every available log for a specified period (up to 7 days) and write them into a `logs.txt` file.
 
-## Unresolved issue with API Usage
+## Requirements
 
-This tool utilises the "undocumented" [internal Fly.io HTTP API endpoint](https://fly.io/docs/monitoring/logs-api-options/#1-http-api-same-as-fly-logs) to stream logs. This _claims_ to provide historical logs going back to the current retention window (about 15 days). However, currently it appears to only return logs from the past day or so.
-
-## Motivation
-
-I built this to get a clean, static slice of recent logs.
-
-While `fly logs` is great for live tailing, I often want to collate logs from the past week or two into a format that is:
-
-1.  **Readable** (No raw JSON, no ANSI color codes).
-2.  **Finite** (It stops writing once it catches up).
-3.  **Token-efficient** (Ideal for pasting into LLMs with large context windows, such as Gemini, for debugging).
-
-## Auth
-
-In order to access the Fly.io logs API, you need to authenticate. This tool supports two methods:
-
-- **flyctl Auth:** If you have the `flyctl` CLI installed and authenticated, the tool can automatically use it for credentials. This is the default/easiest method.
-- **Manual Token:** Set the `FLY_API_TOKEN` environment variable with your Fly.io API token.
+- Go 1.22 or later
+- A Fly.io API token, or an authenticated `fly` CLI installation
 
 ## Usage
 
-### Prerequisites
-
-- Go 1.22+
-- `flyctl` installed (optional, for automatic authentication)
-
-### Quick Start
-
-Export the last 24 hours of logs to a file:
+Export the last 24 hours of logs:
 
 ```bash
-go run . --app my-app-name
+go run . --app my-app
 ```
 
-Fetch the last 3 days from a specific region and pipe to another tool:
+Export the last three days:
 
 ```bash
-go run . --app my-app-name --days 3 --region syd --out - | grep "error"
+go run . --app my-app --days 3
 ```
 
-### Flags
+Export logs from one region:
 
-| Flag            | Default            | Description                                                        |
-| :-------------- | :----------------- | :----------------------------------------------------------------- |
-| `--app`         | _required_         | The name of your Fly application.                                  |
-| `--days`        | `1`                | How many days back to start fetching logs (max 15).                |
-| `--region`      | _(all)_            | Filter logs by region (e.g., `syd`, `iad`).                        |
-| `--out`         | `logs.compact.txt` | Output path. Use `-` for stdout.                                   |
-| `--compact-max` | `0`                | Truncate messages longer than N characters (0 = no limit).         |
-| `--idle`        | `10s`              | How long to wait for new logs before checking if we are caught up. |
+```bash
+go run . --app my-app --days 3 --region syd
+```
 
-## Output Format
+The command creates `logs.txt` in the current directory. If the file already exists, it is replaced.
 
-The tool produces a space-separated format designed for easy scanning:
+### Options
+
+| Option     | Default     | Description                             |
+| ---------- | ----------- | --------------------------------------- |
+| `--app`    | Required    | Fly.io application name                 |
+| `--days`   | `1`         | Number of days to request, from 1 to 7  |
+| `--region` | All regions | Fly.io region to include, such as `syd` |
+
+## Authentication
+
+If `FLY_API_TOKEN` is set, the tool uses it directly:
+
+```bash
+export FLY_API_TOKEN="$(fly auth token)"
+go run . --app my-app
+```
+
+If `FLY_API_TOKEN` is not set, the tool runs `fly tokens create deploy` to create a one hour deploy token for the requested application. This requires you to have the `fly` CLI installed and authenticated.
+
+## Output
+
+Each log entry is written on one line:
 
 ```text
-TIMESTAMP            LVL   REG  INSTANCE MESSAGE
-2025-01-20T08:15:23Z INFO  syd  9185936b Request processed in 45ms status=200
-2025-01-20T08:15:24Z ERROR syd  9185936b Database connection failed \n retrying...
+2026-09-25T08:15:23.47022662Z INFO  Request completed status=200
+2026-09-25T08:16:04Z ERROR Database connection failed \n retrying
 ```
+
+Fly.io only keeps recent logs for a limited period, currently around 7 days. This tool can only export logs that Fly.io still has available.
